@@ -1,0 +1,189 @@
+i have delta table in adls here i have two grops people like hr and developer  they accessing those data in databricks using through pyspark here developr group have the access in read(select) and write(insert) access in delta table
+and hr can access only read not write but both group not have to delete , drop in the adls delta table
+
+here i need to create service principle using key valt and rbac and store credintial and external loactio and etc. clarify me what are the access what they need in azure and databrics
+i need souce code and each step
+
+
+Interview Answer:
+"I create a Service Principal in Entra ID and store its credentials in Azure Key Vault. Using Unity Catalog, I create a Storage Credential backed by the Service Principal and an External Location pointing to ADLS. I grant Storage Blob Data Contributor to the Service Principal on ADLS. For Databricks access control, I use Unity Catalog permissions. HR receives SELECT only, while Developers receive SELECT and MODIFY. I do not grant OWNERSHIP, MANAGE, or ALL PRIVILEGES, preventing both groups from dropping objects. This provides centralized governance with Azure RBAC for storage access and Unity Catalog for table-level authorization."
+
+This is a very common Unity Catalog + ADLS + RBAC interview scenario.
+Requirement: You have a Delta table in ADLS:
+ADLS
+ └── sales/
+      └── Delta Table
+Two groups: HR Group,Developer Group
+
+Permissions:
+Group	SELECT	INSERT	UPDATE	DELETE	DROP
+HR	✅	❌	❌	❌	❌
+Developer	✅	✅	✅	❌	❌
+
+Step 1: Create Service Principal in Azure:
+Azure Portal
+Microsoft Entra ID
+    ↓
+App Registrations
+    ↓
+New Registration
+
+Create: Name: databricks-adls-sp
+Capture:Application (Client) ID, Tenant ID
+
+Step 2: Create Secret->
+Certificates & Secrets
+    ↓
+New Client Secret
+
+Copy: Client Secret
+Example: client-id, tenant-id, client-secret
+
+Step 3: Store in Azure Key Vault
+Create secrets: client-id, tenant-id, client-secret
+
+Example Azure CLI:
+az keyvault secret set \
+--vault-name my-kv \
+--name client-id \
+--value "xxxxxxxx"
+az keyvault secret set \
+--vault-name my-kv \
+--name tenant-id \
+--value "yyyyyyyy"
+az keyvault secret set \
+--vault-name my-kv \
+--name client-secret \
+--value "zzzzzzzz"
+
+Step 4: Give Storage Access: Go to ADLS
+Storage Account
+      ↓
+IAM
+      ↓
+Add Role Assignment
+
+Assign: Storage Blob Data Contributor
+to: databricks-adls-sp
+
+Why? 
+Unity Catalog Storage Credential
+       ↓
+Uses Service Principal
+       ↓
+Needs ADLS access
+
+Step 5: Create Key Vault Backed Secret Scope: Already done:
+databricks secrets create-scope \
+--scope kv-scope \
+--scope-backend-type AZURE_KEYVAULT \
+--resource-id <kv-resource-id> \
+--dns-name https://my-kv.vault.azure.net/
+Step 6: Create Storage Credential
+
+Databricks SQL
+CREATE STORAGE CREDENTIAL adls_cred
+WITH AZURE_SERVICE_PRINCIPAL (
+  CLIENT_ID '<client-id>',
+  CLIENT_SECRET '{{secrets/kv-scope/client-secret}}',
+  TENANT_ID '<tenant-id>'
+);
+Verify: DESCRIBE STORAGE CREDENTIAL adls_cred;
+
+Step 7: Create External Location
+CREATE EXTERNAL LOCATION hr_dev_location
+URL 'abfss://raw@storageaccount.dfs.core.windows.net/'
+WITH (
+  STORAGE CREDENTIAL adls_cred);
+Verify: SHOW EXTERNAL LOCATIONS;
+
+Step 8: Create Catalog : CREATE CATALOG company_catalog;
+Step 9: Create Schema :CREATE SCHEMA company_catalog.hr_schema;
+Step 10: Create Delta Table:
+CREATE TABLE company_catalog.hr_schema.employee
+( emp_id INT,
+ emp_name STRING,
+ salary DOUBLE)
+USING DELTA;
+Step 11: Create Databricks Groups: hr_group, developer_group
+through:
+Databricks Admin Console
+     ↓
+Groups
+
+Step 12: Grant External Location Access: Both groups need read access to files.
+GRANT READ FILES
+ON EXTERNAL LOCATION hr_dev_location
+TO `hr_group`;
+GRANT READ FILES
+ON EXTERNAL LOCATION hr_dev_location
+TO `developer_group`;
+
+Step 13: Catalog Permissions:  GRANT USE CATALOG ON CATALOG company_catalog TO `hr_group`;
+GRANT USE CATALOG ON CATALOG company_catalog TO `developer_group`;
+
+Step 14: Schema Permissions: GRANT USE SCHEMA ON SCHEMA company_catalog.hr_schema TO `hr_group`;
+GRANT USE SCHEMA ON SCHEMA company_catalog.hr_schema TO `developer_group`;
+
+Step 15: Table Permissions: HR Read Only:HR can: SELECT * FROM employee; HR cannot: INSERT, UPDATE, DELETE,DROP
+GRANT SELECT ON TABLE company_catalog.hr_schema.employee TO `hr_group`;
+
+Developer:GRANT SELECT
+ON TABLE company_catalog.hr_schema.employee
+TO `developer_group`;
+GRANT MODIFY
+ON TABLE company_catalog.hr_schema.employee
+TO `developer_group`;
+
+Developer can: SELECT, INSERT, UPDATE, MERGE
+Example: INSERT INTO employee VALUES(1,'John',50000);
+
+Prevent Delete and Drop:
+Do NOT grant: OWNERSHIP or MANAGE or ALL PRIVILEGES  to developers.
+
+Test : Login as HR -> SELECT * FROM employee;
+
+✅ Works
+
+INSERT INTO employee
+VALUES(2,'ABC',1000);
+
+❌ Permission Denied
+
+Login as Developer
+
+INSERT INTO employee
+VALUES(2,'ABC',1000);
+
+✅ Works
+
+UPDATE employee
+SET salary=60000
+WHERE emp_id=1;
+
+✅ Works
+
+DELETE FROM employee
+WHERE emp_id=1;
+
+❌ Permission Denied (if DELETE is not granted)
+
+Behind the Hood Architecture
+HR Group
+     ↓
+Unity Catalog Permission
+     ↓
+External Location
+     ↓
+Storage Credential
+     ↓
+Service Principal
+     ↓
+Azure Key Vault Secret
+     ↓
+ADLS Delta Table
+
+Core Databricks: "Secret Scopes and Spark configurations only provide authentication to external resources such as ADLS. They do not automatically grant Databricks permissions. Workspace access, cluster permissions, and SQL Warehouse permissions must be granted separately within Databricks. Typically, I assign Azure RBAC roles such as Storage Blob Data Reader or Contributor for storage access, and Databricks permissions such as Workspace User, Cluster Attach, and SQL Warehouse Use depending on the user's responsibilities." Workspace Access Grant: Workspace User-> Allows: Login Create notebooks Run notebooks. 
+Cluster Access: Go to Cluster ->Compute ↓ Cluster ↓ Permissions ->Grant: CAN ATTACH TO or CAN RESTART or CAN MANAGE ->Example: Developer Group ↓ CAN ATTACH TO. 
+SQL Warehouse Access Go to: SQL Warehouses ↓ Warehouse ↓ Permissions ->Grant: CAN USE Example: HR Group , Developer Group.
+
